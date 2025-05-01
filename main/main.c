@@ -5,61 +5,118 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 
-static const char *TAG = "Semaforos_GPIO";
+static const char *TAG = "Semaforos";
 
-// Pines disponibles
-#define GPIO_PIN1 17
-#define GPIO_PIN2 18
+// Pines GPIO
+#define GPIO_PIN_1 17
+#define GPIO_PIN_2 18
 
-// Semáforos por cada pin
+// Semáforos para los pines
 SemaphoreHandle_t sem_pin1;
 SemaphoreHandle_t sem_pin2;
 
-// Prototipo de función
-void led_task(void *param);
+// Estados de los pines
+bool pin1_ocupado = false;
+bool pin2_ocupado = false;
 
-typedef struct {
-    int blink_time_ms;   // Tiempo entre encendidos (período)
-    int total_time_ms;   // Duración total de la tarea
-    const char* task_name;
-} task_config_t;
-
-void led_task(void *param)
+// Función para parpadear un LED en un pin
+void blink_led(int gpio, int period_ms, int duration_ms)
 {
-    task_config_t *config = (task_config_t *) param;
-    int pin = -1;
+    int cycles = duration_ms / period_ms;
+    for (int i = 0; i < cycles; i++) {
+        gpio_set_level(gpio, 1);
+        vTaskDelay((period_ms / 2) / portTICK_PERIOD_MS);
+        gpio_set_level(gpio, 0);
+        vTaskDelay((period_ms / 2) / portTICK_PERIOD_MS);
+    }
+}
 
-    // Intenta tomar un semáforo (cualquiera de los dos)
-    while (1) {
-        if (xSemaphoreTake(sem_pin1, 0) == pdTRUE) {
-            pin = GPIO_PIN1;
-            break;
-        } else if (xSemaphoreTake(sem_pin2, 0) == pdTRUE) {
-            pin = GPIO_PIN2;
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100)); // Espera y reintenta
+// Lógica de acceso al recurso (pin)
+int obtener_pin_disponible(int tarea_id, bool *esperando_reportado)
+{
+    if (xSemaphoreTake(sem_pin1, 0) == pdTRUE) {
+        pin1_ocupado = true;
+        *esperando_reportado = false;
+        return GPIO_PIN_1;
+    }
+    if (xSemaphoreTake(sem_pin2, 0) == pdTRUE) {
+        pin2_ocupado = true;
+        *esperando_reportado = false;
+        return GPIO_PIN_2;
     }
 
-    // Configurar el pin
-    gpio_pad_select_gpio(pin);
-    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
-
-    ESP_LOGI(TAG, "%s usando GPIO %d", config->task_name, pin);
-
-    int elapsed = 0;
-    while (elapsed < config->total_time_ms) {
-        gpio_set_level(pin, 1);
-        vTaskDelay(pdMS_TO_TICKS(config->blink_time_ms / 2));
-        gpio_set_level(pin, 0);
-        vTaskDelay(pdMS_TO_TICKS(config->blink_time_ms / 2));
-        elapsed += config->blink_time_ms;
+    if (!(*esperando_reportado)) {
+        ESP_LOGI(TAG, "Tarea %d en espera: ambos GPIOs ocupados", tarea_id);
+        *esperando_reportado = true;
     }
+    return -1; // Ambos ocupados
+}
 
-    ESP_LOGI(TAG, "%s terminó. Liberando GPIO %d", config->task_name, pin);
-
-    // Liberar semáforo
-    if (pin == GPIO_PIN1) {
+// Liberar recurso (pin)
+void liberar_pin(int pin, int tarea_id)
+{
+    if (pin == GPIO_PIN_1) {
+        pin1_ocupado = false;
         xSemaphoreGive(sem_pin1);
-    } else if (pin == GPIO_PIN2) {
-        xSemaphore
+        ESP_LOGI(TAG, "Tarea %d terminó. GPIO 17 libre", tarea_id);
+    } else if (pin == GPIO_PIN_2) {
+        pin2_ocupado = false;
+        xSemaphoreGive(sem_pin2);
+        ESP_LOGI(TAG, "Tarea %d terminó. GPIO 18 libre", tarea_id);
+    }
+}
+
+// Plantilla para tareas
+void tarea_func(void *params)
+{
+    int period = ((int*)params)[0];
+    int duration = ((int*)params)[1];
+    int id = ((int*)params)[2];
+
+    bool esperando_reportado = false;
+
+    while (1) {
+        int pin = -1;
+
+        // Esperar hasta obtener un pin disponible
+        while (pin == -1) {
+            pin = obtener_pin_disponible(id, &esperando_reportado);
+            if (pin == -1) {
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
+        }
+
+        ESP_LOGI(TAG, "Tarea %d ejecutándose en GPIO %d", id, pin);
+
+        blink_led(pin, period, duration);
+
+        liberar_pin(pin, id);
+
+        vTaskDelay(500 / portTICK_PERIOD_MS); // Espera antes de volver a intentar
+    }
+}
+
+void app_main(void)
+{
+    // Configurar los pines como salida
+    gpio_set_direction(GPIO_PIN_1, GPIO_MODE_OUTPUT);
+    gpio_set_direction(GPIO_PIN_2, GPIO_MODE_OUTPUT);
+
+    // Crear semáforos binarios
+    sem_pin1 = xSemaphoreCreateBinary();
+    sem_pin2 = xSemaphoreCreateBinary();
+
+    // Inicializar semáforos como disponibles
+    xSemaphoreGive(sem_pin1);
+    xSemaphoreGive(sem_pin2);
+
+    // Parámetros de las tareas [periodo_ms, duracion_ms, id]
+    static int params1[] = {3000, 5000, 1};   // T = 1s, durante 5s
+    static int params2[] = {2000, 3000, 2};    // T = 0.5s, durante 3s
+    static int params3[] = {5000, 10000, 3};  // T = 2s, durante 10s
+
+    // Crear tareas
+    xTaskCreatePinnedToCore(tarea_func, "Tarea1", 2048, params1, 2, NULL, 1);
+    xTaskCreatePinnedToCore(tarea_func, "Tarea2", 2048, params2, 2, NULL, 1);
+    xTaskCreatePinnedToCore(tarea_func, "Tarea3", 2048, params3, 2, NULL, 1);
+}
